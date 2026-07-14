@@ -1,33 +1,24 @@
 "use client";
 
-import { use, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { use, useCallback, useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
-import { toFigmaEmbed } from "@/lib/figma";
-
-type Design = {
-  id: string;
-  title: string;
-  description: string | null;
-  stage: string | null;
-  category: string | null;
-  media_urls: string[] | null;
-  figma_url: string | null;
-  created_at: string;
-  user_id: string | null;
-};
-
-type ProfileMini = {
-  id: string;
-  username: string | null;
-  full_name: string | null;
-  avatar_url: string | null;
-};
 
 type Ratings = {
   usability?: number;
   visual?: number;
   copy?: number;
+};
+
+type Design = {
+  id: string;
+  user_id: string | null;
+  title: string;
+  description: string | null;
+  category: string | null;
+  media_urls: string[] | null;
+  figma_url: string | null;
+  created_at: string | null;
 };
 
 type Feedback = {
@@ -43,37 +34,54 @@ type Feedback = {
   body: string | null;
 };
 
-type Upvote = {
+type Profile = {
   id: string;
-  user_id: string;
-  feedback_id: string;
+  username: string | null;
+  full_name: string | null;
+  avatar_url: string | null;
 };
 
-type ModerationResponse = {
+type Upvote = {
+  id: string;
+  feedback_id: string;
+  user_id: string;
+};
+
+type ModerationResult = {
   action: "ALLOW" | "NUDGE" | "BLOCK";
   rule_hits: string[];
   suggestion: string | null;
+  severity_score: number;
+  model_scores: unknown;
   event_id: string | null;
-  db_error?: string | null;
-  severity_score?: number;
-  model_scores?: {
-    engine?: string;
-    severity_score?: number;
-    toxicity_score?: number;
-    negativity_score?: number;
-    style_score?: number;
-    features?: Record<string, unknown>;
-  } | null;
+  db_error: string | null;
 };
 
-function categoryLabel(category: string | null) {
-  if (category === "PRODUCT") return "Product";
-  return "Web";
+function formatDate(value: string | null) {
+  if (!value) return "";
+  return new Date(value).toLocaleDateString();
 }
 
-function ratingValue(value: number | undefined) {
+function profileLabel(profile: Profile | undefined) {
+  if (!profile) return "Anonymous";
+  if (profile.username) return `@${profile.username}`;
+  return profile.full_name ?? "Anonymous";
+}
+
+function ratingLabel(value: number | undefined) {
   if (!value) return "Not rated";
   return `${value}/5`;
+}
+
+function isFigmaUrl(url: string | null | undefined) {
+  if (!url) return false;
+  return url.includes("figma.com");
+}
+
+function getFigmaEmbedUrl(url: string) {
+  return `https://www.figma.com/embed?embed_host=share&url=${encodeURIComponent(
+    url
+  )}`;
 }
 
 export default function DesignDetailPage({
@@ -84,43 +92,63 @@ export default function DesignDetailPage({
   const { id } = use(params);
 
   const [design, setDesign] = useState<Design | null>(null);
-  const [author, setAuthor] = useState<ProfileMini | null>(null);
   const [feedback, setFeedback] = useState<Feedback[]>([]);
-  const [profiles, setProfiles] = useState<Record<string, ProfileMini>>({});
+  const [profiles, setProfiles] = useState<Record<string, Profile>>({});
   const [upvotes, setUpvotes] = useState<Upvote[]>([]);
-  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
 
-  const [usabilityRating, setUsabilityRating] = useState("3");
-  const [visualRating, setVisualRating] = useState("3");
-  const [copyRating, setCopyRating] = useState("3");
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const [usability, setUsability] = useState("");
+  const [visual, setVisual] = useState("");
+  const [copy, setCopy] = useState("");
   const [pros, setPros] = useState("");
   const [cons, setCons] = useState("");
   const [suggestions, setSuggestions] = useState("");
 
-  const [submitting, setSubmitting] = useState(false);
-  const [loading, setLoading] = useState(true);
-
+  const [posting, setPosting] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
-  const [nudgeNotice, setNudgeNotice] = useState<string | null>(null);
-  const [blockNotice, setBlockNotice] = useState<string | null>(null);
+  const [formWarning, setFormWarning] = useState<string | null>(null);
+  const [moderationWarning, setModerationWarning] = useState<string | null>(
+    null
+  );
 
-  const figmaEmbed = useMemo(() => {
-    if (!design?.figma_url) return null;
-    return toFigmaEmbed(design.figma_url);
-  }, [design?.figma_url]);
+  const mediaUrls = useMemo(() => design?.media_urls ?? [], [design]);
 
-  async function load() {
+  const upvoteCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+
+    for (const upvote of upvotes) {
+      counts[upvote.feedback_id] = (counts[upvote.feedback_id] ?? 0) + 1;
+    }
+
+    return counts;
+  }, [upvotes]);
+
+  const userUpvotes = useMemo(() => {
+    const map: Record<string, boolean> = {};
+
+    for (const upvote of upvotes) {
+      if (upvote.user_id === currentUserId) {
+        map[upvote.feedback_id] = true;
+      }
+    }
+
+    return map;
+  }, [upvotes, currentUserId]);
+
+  const load = useCallback(async () => {
     setLoading(true);
     setMsg(null);
 
     const { data: auth } = await supabase.auth.getUser();
-    const user = auth.user ?? null;
-    setCurrentUserId(user?.id ?? null);
+    const uid = auth.user?.id ?? null;
+    setCurrentUserId(uid);
 
     const { data: designData, error: designError } = await supabase
       .from("designs")
       .select(
-        "id,title,description,stage,category,media_urls,figma_url,created_at,user_id"
+        "id,user_id,title,description,category,media_urls,figma_url,created_at"
       )
       .eq("id", id)
       .maybeSingle();
@@ -132,32 +160,7 @@ export default function DesignDetailPage({
       return;
     }
 
-    const loadedDesign = designData as Design | null;
-
-    if (!loadedDesign) {
-      setDesign(null);
-      setLoading(false);
-      return;
-    }
-
-    const normalizedDesign: Design = {
-      ...loadedDesign,
-      category: loadedDesign.category === "PRODUCT" ? "PRODUCT" : "WEB",
-    };
-
-    setDesign(normalizedDesign);
-
-    if (normalizedDesign.user_id) {
-      const { data: authorData } = await supabase
-        .from("profiles")
-        .select("id,username,full_name,avatar_url")
-        .eq("id", normalizedDesign.user_id)
-        .maybeSingle();
-
-      setAuthor((authorData as ProfileMini) ?? null);
-    } else {
-      setAuthor(null);
-    }
+    setDesign((designData as Design) ?? null);
 
     const { data: feedbackData, error: feedbackError } = await supabase
       .from("feedback")
@@ -165,34 +168,41 @@ export default function DesignDetailPage({
         "id,design_id,user_id,ratings,pros,cons,suggestions,status,created_at,body"
       )
       .eq("design_id", id)
-      .order("created_at", { ascending: true });
+      .eq("status", "PUBLIC")
+      .order("created_at", { ascending: false });
 
     if (feedbackError) {
       setMsg("❌ " + feedbackError.message);
       setFeedback([]);
-      setProfiles({});
-      setUpvotes([]);
       setLoading(false);
       return;
     }
 
-    const feedbackRows = (feedbackData as Feedback[]) ?? [];
-    setFeedback(feedbackRows);
-
-    const feedbackUserIds = Array.from(
-      new Set(feedbackRows.map((f) => f.user_id).filter(Boolean) as string[])
+    const feedbackRows = ((feedbackData ?? []) as Feedback[]).filter(
+      (item) => item.status !== "REMOVED"
     );
 
-    if (feedbackUserIds.length > 0) {
+    setFeedback(feedbackRows);
+
+    const userIds = Array.from(
+      new Set(
+        [
+          designData?.user_id,
+          ...feedbackRows.map((item) => item.user_id),
+        ].filter(Boolean) as string[]
+      )
+    );
+
+    if (userIds.length > 0) {
       const { data: profileData } = await supabase
         .from("profiles")
         .select("id,username,full_name,avatar_url")
-        .in("id", feedbackUserIds);
+        .in("id", userIds);
 
-      const profileMap: Record<string, ProfileMini> = {};
+      const profileMap: Record<string, Profile> = {};
 
-      for (const p of (profileData as ProfileMini[]) ?? []) {
-        profileMap[p.id] = p;
+      for (const profile of (profileData as Profile[]) ?? []) {
+        profileMap[profile.id] = profile;
       }
 
       setProfiles(profileMap);
@@ -200,12 +210,12 @@ export default function DesignDetailPage({
       setProfiles({});
     }
 
-    const feedbackIds = feedbackRows.map((f) => f.id);
+    if (feedbackRows.length > 0) {
+      const feedbackIds = feedbackRows.map((item) => item.id);
 
-    if (feedbackIds.length > 0) {
       const { data: upvoteData } = await supabase
         .from("upvotes")
-        .select("id,user_id,feedback_id")
+        .select("id,feedback_id,user_id")
         .in("feedback_id", feedbackIds);
 
       setUpvotes((upvoteData as Upvote[]) ?? []);
@@ -214,121 +224,49 @@ export default function DesignDetailPage({
     }
 
     setLoading(false);
-  }
+  }, [id]);
 
   useEffect(() => {
     void load();
-  }, [id]);
+  }, [load]);
 
-  function profileLabel(userId: string | null) {
-    if (!userId) return "Unknown user";
-
-    const p = profiles[userId];
-
-    if (!p) return "Unknown user";
-    if (p.username) return `@${p.username}`;
-
-    return p.full_name ?? "Anonymous";
-  }
-
-  function authorLabel() {
-    if (!author) return "Unknown user";
-    if (author.username) return `@${author.username}`;
-    return author.full_name ?? "Anonymous";
-  }
-
-  function initials(name: string) {
-    return name
-      .split(/\s+/)
-      .filter(Boolean)
-      .slice(0, 2)
-      .map((part) => part[0]?.toUpperCase())
-      .join("");
-  }
-
-  function countUpvotes(feedbackId: string) {
-    return upvotes.filter((u) => u.feedback_id === feedbackId).length;
-  }
-
-  function hasUpvoted(feedbackId: string) {
-    if (!currentUserId) return false;
-
-    return upvotes.some(
-      (u) => u.feedback_id === feedbackId && u.user_id === currentUserId
-    );
-  }
-
-  async function toggleUpvote(feedbackId: string) {
+  async function submitFeedback(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
     setMsg(null);
+    setFormWarning(null);
+    setModerationWarning(null);
 
-    if (!currentUserId) {
-      setMsg("Please sign in to upvote feedback.");
+    const { data: auth } = await supabase.auth.getUser();
+    const user = auth.user;
+
+    if (!user) {
+      setMsg("Please log in to submit feedback.");
       return;
     }
 
-    const existing = upvotes.find(
-      (u) => u.feedback_id === feedbackId && u.user_id === currentUserId
-    );
-
-    if (existing) {
-      const { error } = await supabase
-        .from("upvotes")
-        .delete()
-        .eq("id", existing.id);
-
-      if (error) {
-        setMsg("❌ " + error.message);
-        return;
-      }
-
-      setUpvotes((prev) => prev.filter((u) => u.id !== existing.id));
+    if (!usability || !visual || !copy) {
+      setFormWarning(
+        "Please select a rating for usability, visual design, and copy before submitting."
+      );
       return;
     }
-
-    const { data, error } = await supabase
-      .from("upvotes")
-      .insert([
-        {
-          feedback_id: feedbackId,
-          user_id: currentUserId,
-        },
-      ])
-      .select("id,user_id,feedback_id")
-      .single();
-
-    if (error) {
-      setMsg("❌ " + error.message);
-      return;
-    }
-
-    if (data) {
-      setUpvotes((prev) => [...prev, data as Upvote]);
-    }
-  }
-
-  async function submitFeedback(e: React.FormEvent) {
-    e.preventDefault();
-
-    setMsg(null);
-    setNudgeNotice(null);
-    setBlockNotice(null);
 
     const cleanPros = pros.trim();
     const cleanCons = cons.trim();
     const cleanSuggestions = suggestions.trim();
 
     if (!cleanPros && !cleanCons && !cleanSuggestions) {
-      setMsg("Please write at least one piece of feedback before submitting.");
+      setFormWarning("Please write at least one piece of feedback.");
       return;
     }
 
-    const { data: auth } = await supabase.auth.getUser();
-    const user = auth.user ?? null;
+    setPosting(true);
 
-    if (!user) {
-      setMsg("Please sign in to submit feedback.");
-      return;
-    }
+    const ratings: Ratings = {
+      usability: Number(usability),
+      visual: Number(visual),
+      copy: Number(copy),
+    };
 
     const combinedFeedbackText = [
       `Pros: ${cleanPros}`,
@@ -337,8 +275,6 @@ export default function DesignDetailPage({
     ]
       .join("\n")
       .trim();
-
-    setSubmitting(true);
 
     try {
       const moderationResponse = await fetch("/api/moderate", {
@@ -353,32 +289,25 @@ export default function DesignDetailPage({
         }),
       });
 
-      const moderation =
-        (await moderationResponse.json()) as ModerationResponse;
+      const moderation = (await moderationResponse.json()) as ModerationResult;
 
       if (moderation.action === "BLOCK") {
-        setBlockNotice(
+        setMsg(
           moderation.suggestion ??
-            "Your feedback was blocked because it contains inappropriate language."
+            "Your feedback was blocked. Please rewrite it respectfully."
         );
-        setSubmitting(false);
+        setPosting(false);
         return;
       }
 
       if (moderation.action === "NUDGE") {
-        setNudgeNotice(
+        setModerationWarning(
           moderation.suggestion ??
-            "Try rewording your feedback in a more constructive way."
+            "Your feedback was posted, but please try to keep feedback constructive."
         );
       }
 
-      const ratings: Ratings = {
-        usability: Number(usabilityRating),
-        visual: Number(visualRating),
-        copy: Number(copyRating),
-      };
-
-      const { data: insertedFeedback, error: insertError } = await supabase
+      const { data: insertedFeedback, error } = await supabase
         .from("feedback")
         .insert([
           {
@@ -397,50 +326,72 @@ export default function DesignDetailPage({
         )
         .single();
 
-      if (insertError) {
-        setMsg("❌ " + insertError.message);
-        setSubmitting(false);
+      if (error) {
+        setMsg("❌ " + error.message);
+        setPosting(false);
         return;
       }
 
-      const inserted = insertedFeedback as Feedback;
-
-      if (moderation.event_id) {
+      if (moderation.event_id && insertedFeedback?.id) {
         await supabase
           .from("moderation_events")
           .update({
-            feedback_id: inserted.id,
-            target_id: id,
-            target_type: "FEEDBACK",
+            feedback_id: insertedFeedback.id,
           })
           .eq("id", moderation.event_id);
-      }
-
-      setFeedback((prev) => [...prev, inserted]);
-
-      const { data: profileData } = await supabase
-        .from("profiles")
-        .select("id,username,full_name,avatar_url")
-        .eq("id", user.id)
-        .maybeSingle();
-
-      if (profileData) {
-        setProfiles((prev) => ({
-          ...prev,
-          [user.id]: profileData as ProfileMini,
-        }));
       }
 
       setPros("");
       setCons("");
       setSuggestions("");
-      setUsabilityRating("3");
-      setVisualRating("3");
-      setCopyRating("3");
-      setMsg("✅ Feedback submitted.");
-    } finally {
-      setSubmitting(false);
+      setUsability("");
+      setVisual("");
+      setCopy("");
+
+      setMsg("✅ Feedback posted.");
+      setPosting(false);
+      await load();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      setMsg("❌ " + message);
+      setPosting(false);
     }
+  }
+
+  async function toggleUpvote(feedbackId: string) {
+    if (!currentUserId) {
+      setMsg("Please log in to upvote feedback.");
+      return;
+    }
+
+    const alreadyUpvoted = userUpvotes[feedbackId];
+
+    if (alreadyUpvoted) {
+      const { error } = await supabase
+        .from("upvotes")
+        .delete()
+        .eq("feedback_id", feedbackId)
+        .eq("user_id", currentUserId);
+
+      if (error) {
+        setMsg("❌ " + error.message);
+        return;
+      }
+    } else {
+      const { error } = await supabase.from("upvotes").insert([
+        {
+          feedback_id: feedbackId,
+          user_id: currentUserId,
+        },
+      ]);
+
+      if (error) {
+        setMsg("❌ " + error.message);
+        return;
+      }
+    }
+
+    await load();
   }
 
   if (loading) {
@@ -450,19 +401,21 @@ export default function DesignDetailPage({
   if (!design) {
     return (
       <div className="space-y-4">
+        <div className="glass-card glass p-5">
+          <h1 className="text-2xl font-semibold">Design not found</h1>
+          <p className="mt-2 text-sm text-neutral-400">
+            This design may have been removed or does not exist.
+          </p>
+        </div>
+
         <Link href="/designs" className="btn">
           ← Back to designs
         </Link>
-
-        <div className="glass-card glass p-5">
-          <p className="text-neutral-300">Design not found.</p>
-        </div>
       </div>
     );
   }
 
-  const image = design.media_urls?.[0] ?? null;
-  const authorName = authorLabel();
+  const author = design.user_id ? profiles[design.user_id] : undefined;
 
   return (
     <div className="space-y-6">
@@ -470,307 +423,299 @@ export default function DesignDetailPage({
         ← Back to designs
       </Link>
 
-      <article className="glass-card glass overflow-hidden">
-        <div className="p-5 space-y-4">
-          <div className="space-y-3">
-            <div className="flex flex-wrap items-center gap-2 text-xs text-neutral-400">
-              <span className="chip">{categoryLabel(design.category)}</span>
+      <section className="glass-card glass p-5 space-y-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <p className="chip w-fit">{design.category ?? "Design"}</p>
 
-              {design.stage && <span className="chip">{design.stage}</span>}
-
-              <span>{new Date(design.created_at).toLocaleString()}</span>
-            </div>
-
-            <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight">
+            <h1 className="mt-3 hero-title text-4xl sm:text-5xl font-semibold">
               {design.title}
             </h1>
 
-            {design.user_id && (
-              <Link
-                href={`/profile/${design.user_id}`}
-                className="inline-flex items-center gap-2 text-sm hover:underline"
-              >
-                {author?.avatar_url ? (
-                  <img
-                    src={author.avatar_url}
-                    alt={authorName}
-                    className="h-8 w-8 rounded-full object-cover border border-neutral-800"
-                  />
-                ) : (
-                  <div className="h-8 w-8 rounded-full bg-neutral-800 grid place-items-center text-[10px] font-semibold">
-                    {initials(authorName)}
-                  </div>
-                )}
-
-                <span>{authorName}</span>
-              </Link>
-            )}
-          </div>
-
-          {design.description ? (
-            <p className="text-sm text-neutral-300 whitespace-pre-wrap leading-6">
-              {design.description}
+            <p className="mt-2 text-sm text-neutral-400">
+              Posted by{" "}
+              {design.user_id ? (
+                <Link
+                  href={`/profile/${design.user_id}`}
+                  className="font-semibold text-neutral-200 hover:underline"
+                >
+                  {profileLabel(author)}
+                </Link>
+              ) : (
+                "Anonymous"
+              )}
+              {design.created_at ? ` · ${formatDate(design.created_at)}` : ""}
             </p>
-          ) : (
-            <p className="text-sm text-neutral-500">No description.</p>
-          )}
+          </div>
         </div>
 
-        <div className="preview-frame">
-          {figmaEmbed ? (
+        {design.description && (
+          <p className="max-w-3xl leading-7 text-neutral-300">
+            {design.description}
+          </p>
+        )}
+
+        {isFigmaUrl(design.figma_url) && (
+          <div className="overflow-hidden rounded-3xl border border-white/10 bg-black/30">
             <iframe
-              src={figmaEmbed}
-              className="w-full h-[560px]"
+              title="Figma preview"
+              src={getFigmaEmbedUrl(design.figma_url as string)}
+              className="h-[760px] min-h-[760px] w-full"
               allowFullScreen
             />
-          ) : image ? (
-            <img
-              src={image}
-              alt={design.title}
-              className="w-full max-h-[680px] object-contain bg-neutral-900"
-            />
-          ) : (
-            <div className="h-96 w-full bg-neutral-900 grid place-items-center text-neutral-600">
-              No preview
-            </div>
-          )}
-        </div>
-      </article>
+          </div>
+        )}
+
+        {mediaUrls.length > 0 && (
+          <div className="grid gap-4">
+            {mediaUrls.map((url) => (
+              <div
+                key={url}
+                className="overflow-hidden rounded-3xl border border-white/10 bg-black/30"
+              >
+                <img
+                  src={url}
+                  alt={design.title}
+                  className="w-full object-contain"
+                />
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       {msg && <p className="glass-card glass px-3 py-2 text-sm">{msg}</p>}
 
-      <section className="glass-card glass p-5 space-y-4">
+      {formWarning && (
+        <div className="rounded-2xl border border-sky-400/30 bg-sky-400/10 px-4 py-3 text-sm text-sky-100">
+          {formWarning}
+        </div>
+      )}
+
+      {moderationWarning && (
+        <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          {moderationWarning}
+        </div>
+      )}
+
+      <section className="glass-card glass p-5">
+        <h2 className="text-2xl font-semibold">Leave structured feedback</h2>
+
+        {!currentUserId ? (
+          <p className="mt-2 text-sm text-neutral-400">
+            Please{" "}
+            <Link href="/login" className="font-semibold hover:underline">
+              log in
+            </Link>{" "}
+            to submit feedback.
+          </p>
+        ) : (
+          <form className="mt-5 space-y-4" onSubmit={submitFeedback}>
+            <div className="grid gap-3 sm:grid-cols-3">
+              <label className="space-y-2 text-sm">
+                <span className="text-neutral-300">Usability</span>
+                <select
+                  className="input select-input"
+                  value={usability}
+                  onChange={(event) => setUsability(event.target.value)}
+                >
+                  <option value="" disabled hidden>
+                    Select
+                  </option>
+                  <option value="1">1 - Poor</option>
+                  <option value="2">2</option>
+                  <option value="3">3 - Okay</option>
+                  <option value="4">4</option>
+                  <option value="5">5 - Excellent</option>
+                </select>
+              </label>
+
+              <label className="space-y-2 text-sm">
+                <span className="text-neutral-300">Visual design</span>
+                <select
+                  className="input select-input"
+                  value={visual}
+                  onChange={(event) => setVisual(event.target.value)}
+                >
+                  <option value="" disabled hidden>
+                    Select
+                  </option>
+                  <option value="1">1 - Poor</option>
+                  <option value="2">2</option>
+                  <option value="3">3 - Okay</option>
+                  <option value="4">4</option>
+                  <option value="5">5 - Excellent</option>
+                </select>
+              </label>
+
+              <label className="space-y-2 text-sm">
+                <span className="text-neutral-300">Copy / clarity</span>
+                <select
+                  className="input select-input"
+                  value={copy}
+                  onChange={(event) => setCopy(event.target.value)}
+                >
+                  <option value="" disabled hidden>
+                    Select
+                  </option>
+                  <option value="1">1 - Poor</option>
+                  <option value="2">2</option>
+                  <option value="3">3 - Okay</option>
+                  <option value="4">4</option>
+                  <option value="5">5 - Excellent</option>
+                </select>
+              </label>
+            </div>
+
+            <label className="block space-y-2 text-sm">
+              <span className="text-neutral-300">What works well?</span>
+              <textarea
+                className="input min-h-24"
+                value={pros}
+                onChange={(event) => setPros(event.target.value)}
+                placeholder="Mention the strengths of the design..."
+              />
+            </label>
+
+            <label className="block space-y-2 text-sm">
+              <span className="text-neutral-300">What could be improved?</span>
+              <textarea
+                className="input min-h-24"
+                value={cons}
+                onChange={(event) => setCons(event.target.value)}
+                placeholder="Mention usability, layout, hierarchy, or clarity issues..."
+              />
+            </label>
+
+            <label className="block space-y-2 text-sm">
+              <span className="text-neutral-300">Suggestions</span>
+              <textarea
+                className="input min-h-24"
+                value={suggestions}
+                onChange={(event) => setSuggestions(event.target.value)}
+                placeholder="Suggest practical improvements..."
+              />
+            </label>
+
+            <button
+              disabled={posting}
+              className="btn gradient-fill-btn"
+              type="submit"
+            >
+              {posting ? "Submitting…" : "Submit feedback"}
+            </button>
+          </form>
+        )}
+      </section>
+
+      <section className="space-y-4">
         <div>
-          <h2 className="text-xl font-semibold">Add your feedback</h2>
-          <p className="text-sm text-neutral-400">
-            Rate the design and give structured feedback.
+          <h2 className="text-2xl font-semibold">Feedback</h2>
+          <p className="mt-1 text-sm text-neutral-400">
+            Removed feedback is hidden from this public design page.
           </p>
         </div>
 
-        {blockNotice && (
-          <div className="rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
-            {blockNotice}
-          </div>
-        )}
-
-        {nudgeNotice && (
-          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
-            {nudgeNotice}
-          </div>
-        )}
-
-        <form onSubmit={submitFeedback} className="space-y-4">
-          <div className="grid gap-3 sm:grid-cols-3">
-            <label className="block text-sm">
-              <span className="mb-1 block font-medium">Usability</span>
-              <select
-                className="select"
-                value={usabilityRating}
-                onChange={(e) => setUsabilityRating(e.target.value)}
-              >
-                <option value="1">1 - Poor</option>
-                <option value="2">2 - Needs work</option>
-                <option value="3">3 - Good</option>
-                <option value="4">4 - Very good</option>
-                <option value="5">5 - Excellent</option>
-              </select>
-            </label>
-
-            <label className="block text-sm">
-              <span className="mb-1 block font-medium">Visual design</span>
-              <select
-                className="select"
-                value={visualRating}
-                onChange={(e) => setVisualRating(e.target.value)}
-              >
-                <option value="1">1 - Poor</option>
-                <option value="2">2 - Needs work</option>
-                <option value="3">3 - Good</option>
-                <option value="4">4 - Very good</option>
-                <option value="5">5 - Excellent</option>
-              </select>
-            </label>
-
-            <label className="block text-sm">
-              <span className="mb-1 block font-medium">Copy / clarity</span>
-              <select
-                className="select"
-                value={copyRating}
-                onChange={(e) => setCopyRating(e.target.value)}
-              >
-                <option value="1">1 - Poor</option>
-                <option value="2">2 - Needs work</option>
-                <option value="3">3 - Good</option>
-                <option value="4">4 - Very good</option>
-                <option value="5">5 - Excellent</option>
-              </select>
-            </label>
-          </div>
-
-          <div>
-            <label className="mb-1 block text-sm font-medium">
-              What works well?
-            </label>
-            <textarea
-              className="textarea"
-              rows={3}
-              value={pros}
-              onChange={(e) => setPros(e.target.value)}
-              placeholder="Example: The spacing is clean and the visual hierarchy is clear."
-            />
-          </div>
-
-          <div>
-            <label className="mb-1 block text-sm font-medium">
-              What could be improved?
-            </label>
-            <textarea
-              className="textarea"
-              rows={3}
-              value={cons}
-              onChange={(e) => setCons(e.target.value)}
-              placeholder="Example: The CTA button could use stronger contrast."
-            />
-          </div>
-
-          <div>
-            <label className="mb-1 block text-sm font-medium">
-              Suggestions
-            </label>
-            <textarea
-              className="textarea"
-              rows={3}
-              value={suggestions}
-              onChange={(e) => setSuggestions(e.target.value)}
-              placeholder="Example: Increase contrast, reduce spacing in the header, and align the grid."
-            />
-          </div>
-
-          <button
-            className="btn gradient-fill-btn"
-            disabled={submitting}
-            type="submit"
-          >
-            {submitting ? "Submitting…" : "Submit feedback"}
-          </button>
-        </form>
-      </section>
-
-      <section className="space-y-3">
-        <h2 className="text-xl font-semibold">Feedback</h2>
-
         {feedback.length === 0 ? (
-          <div className="glass-card glass p-4">
+          <div className="glass-card glass p-5">
             <p className="text-sm text-neutral-400">
-              No feedback has been posted yet.
+              No public feedback yet. Be the first to comment.
             </p>
           </div>
         ) : (
-          <div className="space-y-3">
-            {feedback.map((f) => {
-              const label = profileLabel(f.user_id);
-              const avatar = f.user_id
-                ? profiles[f.user_id]?.avatar_url ?? null
-                : null;
+          feedback.map((item) => {
+            const profile = item.user_id ? profiles[item.user_id] : undefined;
 
-              return (
-                <article key={f.id} className="glass-card glass p-4 space-y-4">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                    {f.user_id ? (
-                      <Link
-                        href={`/profile/${f.user_id}`}
-                        className="inline-flex items-center gap-2 text-sm hover:underline"
-                      >
-                        {avatar ? (
-                          <img
-                            src={avatar}
-                            alt={label}
-                            className="h-8 w-8 rounded-full object-cover border border-neutral-800"
-                          />
-                        ) : (
-                          <div className="h-8 w-8 rounded-full bg-neutral-800 grid place-items-center text-[10px] font-semibold">
-                            {initials(label)}
-                          </div>
-                        )}
+            return (
+              <article key={item.id} className="glass-card glass p-5 space-y-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <p className="text-sm font-semibold">
+                      {item.user_id ? (
+                        <Link
+                          href={`/profile/${item.user_id}`}
+                          className="hover:underline"
+                        >
+                          {profileLabel(profile)}
+                        </Link>
+                      ) : (
+                        "Anonymous"
+                      )}
+                    </p>
 
-                        <span>{label}</span>
-                      </Link>
-                    ) : (
-                      <span className="text-sm text-neutral-400">
-                        Unknown user
-                      </span>
-                    )}
-
-                    <span className="text-xs text-neutral-500">
-                      {new Date(f.created_at).toLocaleString()}
-                    </span>
-                  </div>
-
-                  <div className="grid gap-2 sm:grid-cols-3">
-                    <div className="glass rounded-2xl px-3 py-2 text-sm">
-                      <p className="text-xs text-neutral-500">Usability</p>
-                      <p className="font-semibold">
-                        {ratingValue(f.ratings?.usability)}
-                      </p>
-                    </div>
-
-                    <div className="glass rounded-2xl px-3 py-2 text-sm">
-                      <p className="text-xs text-neutral-500">Visual design</p>
-                      <p className="font-semibold">
-                        {ratingValue(f.ratings?.visual)}
-                      </p>
-                    </div>
-
-                    <div className="glass rounded-2xl px-3 py-2 text-sm">
-                      <p className="text-xs text-neutral-500">Copy / clarity</p>
-                      <p className="font-semibold">
-                        {ratingValue(f.ratings?.copy)}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="space-y-3 text-sm leading-6">
-                    <div>
-                      <p className="font-semibold text-neutral-100">
-                        What works well
-                      </p>
-                      <p className="whitespace-pre-wrap text-neutral-300">
-                        {f.pros || "No pros added."}
-                      </p>
-                    </div>
-
-                    <div>
-                      <p className="font-semibold text-neutral-100">
-                        What could be improved
-                      </p>
-                      <p className="whitespace-pre-wrap text-neutral-300">
-                        {f.cons || "No cons added."}
-                      </p>
-                    </div>
-
-                    <div>
-                      <p className="font-semibold text-neutral-100">
-                        Suggestions
-                      </p>
-                      <p className="whitespace-pre-wrap text-neutral-300">
-                        {f.suggestions || "No suggestions added."}
-                      </p>
-                    </div>
+                    <p className="mt-1 text-xs text-neutral-500">
+                      {formatDate(item.created_at)}
+                    </p>
                   </div>
 
                   <button
-                    className={`btn ${
-                      hasUpvoted(f.id) ? "bg-neutral-100 text-neutral-900" : ""
-                    }`}
-                    onClick={() => void toggleUpvote(f.id)}
                     type="button"
+                    className="btn"
+                    onClick={() => void toggleUpvote(item.id)}
                   >
-                    ▲ {countUpvotes(f.id)}
+                    {userUpvotes[item.id] ? "Upvoted" : "Upvote"} ·{" "}
+                    {upvoteCounts[item.id] ?? 0}
                   </button>
-                </article>
-              );
-            })}
-          </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-3">
+                  <div className="glass rounded-2xl p-3">
+                    <p className="text-xs text-neutral-500">Usability</p>
+                    <p className="mt-1 font-semibold">
+                      {ratingLabel(item.ratings?.usability)}
+                    </p>
+                  </div>
+
+                  <div className="glass rounded-2xl p-3">
+                    <p className="text-xs text-neutral-500">Visual</p>
+                    <p className="mt-1 font-semibold">
+                      {ratingLabel(item.ratings?.visual)}
+                    </p>
+                  </div>
+
+                  <div className="glass rounded-2xl p-3">
+                    <p className="text-xs text-neutral-500">Copy</p>
+                    <p className="mt-1 font-semibold">
+                      {ratingLabel(item.ratings?.copy)}
+                    </p>
+                  </div>
+                </div>
+
+                {item.pros && (
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+                      What works well
+                    </p>
+                    <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-neutral-300">
+                      {item.pros}
+                    </p>
+                  </div>
+                )}
+
+                {item.cons && (
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+                      What could be improved
+                    </p>
+                    <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-neutral-300">
+                      {item.cons}
+                    </p>
+                  </div>
+                )}
+
+                {item.suggestions && (
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide text-neutral-500">
+                      Suggestions
+                    </p>
+                    <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-neutral-300">
+                      {item.suggestions}
+                    </p>
+                  </div>
+                )}
+              </article>
+            );
+          })
         )}
       </section>
     </div>
