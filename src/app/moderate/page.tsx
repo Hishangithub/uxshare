@@ -357,65 +357,24 @@ export default function ModeratePage() {
       return;
     }
 
+    const { error } = await supabase.rpc("remove_feedback_from_moderation", {
+      p_event_id: event.id,
+      p_feedback_id: feedbackIdToDelete,
+    });
+
+    if (error) {
+      setMsg("❌ Could not remove feedback: " + error.message);
+      setBusyId(null);
+      return;
+    }
+
     const removedAt = new Date().toISOString();
-
-    /*
-      Important:
-      We save the removed label BEFORE deleting feedback.
-      This makes the red label stay visible on the moderation card,
-      even after the feedback row is deleted from the feedback table.
-    */
-    const { data: updatedEvent, error: eventUpdateError } = await supabase
-      .from("moderation_events")
-      .update({
-        feedback_removed: true,
-        feedback_removed_at: removedAt,
-      })
-      .eq("id", event.id)
-      .select(
-        "id,target_type,target_id,design_id,feedback_id,user_id,rule_hits,model_scores,action,suggestion,original_text,reviewed,feedback_removed,feedback_removed_at,created_at"
-      )
-      .single();
-
-    if (eventUpdateError) {
-      setMsg(
-        "❌ Could not save the removed label before deleting feedback: " +
-          eventUpdateError.message
-      );
-      setBusyId(null);
-      return;
-    }
-
-    const { error: upvoteError } = await supabase
-      .from("upvotes")
-      .delete()
-      .eq("feedback_id", feedbackIdToDelete);
-
-    if (upvoteError) {
-      setMsg("❌ Could not remove related upvotes: " + upvoteError.message);
-      setBusyId(null);
-      await load();
-      return;
-    }
-
-    const { error: feedbackError } = await supabase
-      .from("feedback")
-      .delete()
-      .eq("id", feedbackIdToDelete);
-
-    if (feedbackError) {
-      setMsg("❌ Could not remove feedback: " + feedbackError.message);
-      setBusyId(null);
-      await load();
-      return;
-    }
 
     setEvents((prev) =>
       prev.map((item) =>
         item.id === event.id
           ? {
               ...item,
-              ...(updatedEvent as ModerationEvent),
               feedback_removed: true,
               feedback_removed_at: removedAt,
             }
