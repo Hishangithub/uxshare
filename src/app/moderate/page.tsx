@@ -52,6 +52,8 @@ type FeedbackSearchResult = {
   pros: string | null;
   cons: string | null;
   suggestions: string | null;
+  status: string | null;
+  created_at: string | null;
 };
 
 function actionLabel(action: string | null) {
@@ -75,6 +77,10 @@ function actionClass(action: string | null) {
   }
 
   return "border-white/10 bg-white/10 text-neutral-300";
+}
+
+function removedClass() {
+  return "border-red-500/50 bg-red-500/15 text-red-200";
 }
 
 function formatDate(value: string | null) {
@@ -104,6 +110,9 @@ export default function ModeratePage() {
   const [events, setEvents] = useState<ModerationEvent[]>([]);
   const [profiles, setProfiles] = useState<Record<string, ProfileMini>>({});
   const [designs, setDesigns] = useState<Record<string, DesignMini>>({});
+  const [feedbackStatuses, setFeedbackStatuses] = useState<
+    Record<string, string>
+  >({});
 
   const [loading, setLoading] = useState(true);
   const [checkingRole, setCheckingRole] = useState(true);
@@ -113,10 +122,19 @@ export default function ModeratePage() {
   const [msg, setMsg] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
 
+  function getIsRemoved(event: ModerationEvent) {
+    const status = event.feedback_id ? feedbackStatuses[event.feedback_id] : null;
+    return Boolean(event.feedback_removed) || status === "REMOVED";
+  }
+
   const shownEvents = useMemo(() => {
     if (filter === "ALL") return events;
-    return events.filter((event) => !event.reviewed);
-  }, [events, filter]);
+
+    return events.filter((event) => {
+      const isRemoved = getIsRemoved(event);
+      return !event.reviewed && !isRemoved;
+    });
+  }, [events, feedbackStatuses, filter]);
 
   const checkModeratorRole = useCallback(async () => {
     setCheckingRole(true);
@@ -158,6 +176,7 @@ export default function ModeratePage() {
       setEvents([]);
       setProfiles({});
       setDesigns({});
+      setFeedbackStatuses({});
       setLoading(false);
       return;
     }
@@ -177,6 +196,10 @@ export default function ModeratePage() {
 
     const designIds = Array.from(
       new Set(rows.map((event) => event.design_id).filter(Boolean) as string[])
+    );
+
+    const feedbackIds = Array.from(
+      new Set(rows.map((event) => event.feedback_id).filter(Boolean) as string[])
     );
 
     if (userIds.length > 0) {
@@ -211,6 +234,24 @@ export default function ModeratePage() {
       setDesigns(designMap);
     } else {
       setDesigns({});
+    }
+
+    if (feedbackIds.length > 0) {
+      const { data: feedbackData } = await supabase
+        .from("feedback")
+        .select("id,status")
+        .in("id", feedbackIds);
+
+      const statusMap: Record<string, string> = {};
+
+      for (const feedback of
+        (feedbackData as { id: string; status: string | null }[]) ?? []) {
+        statusMap[feedback.id] = feedback.status ?? "PUBLIC";
+      }
+
+      setFeedbackStatuses(statusMap);
+    } else {
+      setFeedbackStatuses({});
     }
 
     setLoading(false);
@@ -282,7 +323,7 @@ export default function ModeratePage() {
 
     const { data, error } = await supabase
       .from("feedback")
-      .select("id,body,pros,cons,suggestions")
+      .select("id,body,pros,cons,suggestions,status,created_at")
       .eq("design_id", event.design_id)
       .eq("user_id", event.user_id)
       .order("created_at", { ascending: false });
@@ -291,7 +332,10 @@ export default function ModeratePage() {
       throw new Error(error.message);
     }
 
-    const possibleFeedback = (data ?? []) as FeedbackSearchResult[];
+    const possibleFeedback = ((data ?? []) as FeedbackSearchResult[]).filter(
+      (item) => item.status !== "REMOVED"
+    );
+
     const original = normalizeText(event.original_text);
 
     if (!original) return possibleFeedback[0]?.id ?? null;
@@ -321,24 +365,28 @@ export default function ModeratePage() {
   async function removeFeedback(event: ModerationEvent) {
     setMsg(null);
 
-    if (event.feedback_removed) {
+    const currentFeedbackStatus = event.feedback_id
+      ? feedbackStatuses[event.feedback_id]
+      : null;
+
+    if (event.feedback_removed || currentFeedbackStatus === "REMOVED") {
       setMsg("This feedback has already been removed.");
       return;
     }
 
     const confirmed = window.confirm(
-      "Are you sure you want to remove this feedback? This will delete it from the public design page and mark it as removed in the moderation dashboard."
+      "Are you sure you want to remove this feedback? It will be hidden from the public design page and marked as removed in the moderation dashboard."
     );
 
     if (!confirmed) return;
 
     setBusyId(event.id);
 
-    let feedbackIdToDelete = event.feedback_id;
+    let feedbackIdToUpdate = event.feedback_id;
 
-    if (!feedbackIdToDelete) {
+    if (!feedbackIdToUpdate) {
       try {
-        feedbackIdToDelete = await findMatchingFeedback(event);
+        feedbackIdToUpdate = await findMatchingFeedback(event);
       } catch (error) {
         const message =
           error instanceof Error ? error.message : "Unknown matching error";
@@ -349,7 +397,7 @@ export default function ModeratePage() {
       }
     }
 
-    if (!feedbackIdToDelete) {
+    if (!feedbackIdToUpdate) {
       setMsg(
         "This moderation event is not linked to a posted feedback record, and no matching feedback could be found."
       );
@@ -357,24 +405,50 @@ export default function ModeratePage() {
       return;
     }
 
-    const { error } = await supabase.rpc("remove_feedback_from_moderation", {
-      p_event_id: event.id,
-      p_feedback_id: feedbackIdToDelete,
-    });
+    const removedAt = new Date().toISOString();
 
-    if (error) {
-      setMsg("❌ Could not remove feedback: " + error.message);
+    const { error: feedbackError } = await supabase
+      .from("feedback")
+      .update({ status: "REMOVED" })
+      .eq("id", feedbackIdToUpdate);
+
+    if (feedbackError) {
+      setMsg("❌ Could not mark feedback as removed: " + feedbackError.message);
       setBusyId(null);
       return;
     }
 
-    const removedAt = new Date().toISOString();
+    const { error: eventError } = await supabase
+      .from("moderation_events")
+      .update({
+        feedback_id: feedbackIdToUpdate,
+        reviewed: true,
+        feedback_removed: true,
+        feedback_removed_at: removedAt,
+      })
+      .eq("id", event.id);
+
+    if (eventError) {
+      setMsg(
+        "Feedback was hidden, but the moderation event could not be updated: " +
+          eventError.message
+      );
+    } else {
+      setMsg("✅ Feedback removed and labelled in the moderation dashboard.");
+    }
+
+    setFeedbackStatuses((prev) => ({
+      ...prev,
+      [feedbackIdToUpdate]: "REMOVED",
+    }));
 
     setEvents((prev) =>
       prev.map((item) =>
         item.id === event.id
           ? {
               ...item,
+              feedback_id: item.feedback_id ?? feedbackIdToUpdate,
+              reviewed: true,
               feedback_removed: true,
               feedback_removed_at: removedAt,
             }
@@ -382,9 +456,8 @@ export default function ModeratePage() {
       )
     );
 
-    setMsg("✅ Feedback removed. The moderation card is now labelled as removed.");
+    setFilter("ALL");
     setBusyId(null);
-
     await load();
   }
 
@@ -409,8 +482,12 @@ export default function ModeratePage() {
     );
   }
 
-  const removedCount = events.filter((event) => event.feedback_removed).length;
-  const unreviewedCount = events.filter((event) => !event.reviewed).length;
+  const removedCount = events.filter((event) => getIsRemoved(event)).length;
+
+  const unreviewedCount = events.filter((event) => {
+    const isRemoved = getIsRemoved(event);
+    return !event.reviewed && !isRemoved;
+  }).length;
 
   return (
     <div className="space-y-6">
@@ -495,7 +572,7 @@ export default function ModeratePage() {
             const rules = event.rule_hits ?? [];
             const scores = event.model_scores ?? null;
             const isBusy = busyId === event.id;
-            const isRemoved = Boolean(event.feedback_removed);
+            const isRemoved = getIsRemoved(event);
 
             const canRemoveFeedback =
               !isRemoved &&
@@ -512,72 +589,63 @@ export default function ModeratePage() {
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div className="space-y-2">
                     <div className="flex flex-wrap items-center gap-2">
-                      <span
-                        className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${actionClass(
-                          event.action
-                        )}`}
-                      >
-                        {actionLabel(event.action)}
-                      </span>
-
-                      {isRemoved && (
-                        <span className="inline-flex rounded-full border border-red-500/50 bg-red-500/15 px-3 py-1 text-xs font-semibold text-red-200">
+                      {isRemoved ? (
+                        <span
+                          className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${removedClass()}`}
+                        >
                           Feedback Removed
                         </span>
-                      )}
+                      ) : (
+                        <>
+                          <span
+                            className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold ${actionClass(
+                              event.action
+                            )}`}
+                          >
+                            {actionLabel(event.action)}
+                          </span>
 
-                      <span className="chip">
-                        {event.reviewed ? "Reviewed" : "Unreviewed"}
-                      </span>
+                          <span className="chip">
+                            {event.reviewed ? "Reviewed" : "Unreviewed"}
+                          </span>
+                        </>
+                      )}
                     </div>
 
                     <p className="text-xs text-neutral-500">
                       Submitted on {formatDate(event.created_at)}
                     </p>
-
-                    {isRemoved && (
-                      <p className="text-xs font-medium text-red-300">
-                        Removed on {formatDate(event.feedback_removed_at)}
-                      </p>
-                    )}
                   </div>
 
                   <div className="flex flex-wrap gap-2">
-                    {event.reviewed ? (
-                      <button
-                        className="btn"
-                        type="button"
-                        disabled={isBusy}
-                        onClick={() => void markUnreviewed(event.id)}
-                      >
-                        Mark unreviewed
-                      </button>
-                    ) : (
-                      <button
-                        className="btn"
-                        type="button"
-                        disabled={isBusy}
-                        onClick={() => void markReviewed(event.id)}
-                      >
-                        Mark reviewed
-                      </button>
-                    )}
+                    {!isRemoved &&
+                      (event.reviewed ? (
+                        <button
+                          className="btn"
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => void markUnreviewed(event.id)}
+                        >
+                          Mark unreviewed
+                        </button>
+                      ) : (
+                        <button
+                          className="btn"
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => void markReviewed(event.id)}
+                        >
+                          Mark reviewed
+                        </button>
+                      ))}
 
                     <button
-                      className={
-                        isRemoved
-                          ? "inline-flex items-center justify-center rounded-full border border-red-500/40 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-200 opacity-70"
-                          : "btn"
-                      }
+                      className="btn"
                       type="button"
                       disabled={isBusy || !canRemoveFeedback}
                       onClick={() => void removeFeedback(event)}
                     >
-                      {isBusy
-                        ? "Working…"
-                        : isRemoved
-                          ? "Removed"
-                          : "Remove feedback"}
+                      {isBusy ? "Working…" : "Remove feedback"}
                     </button>
                   </div>
                 </div>
