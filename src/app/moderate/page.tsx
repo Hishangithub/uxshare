@@ -359,6 +359,33 @@ export default function ModeratePage() {
 
     const removedAt = new Date().toISOString();
 
+    /*
+      Important:
+      We save the removed label BEFORE deleting feedback.
+      This makes the red label stay visible on the moderation card,
+      even after the feedback row is deleted from the feedback table.
+    */
+    const { data: updatedEvent, error: eventUpdateError } = await supabase
+      .from("moderation_events")
+      .update({
+        feedback_removed: true,
+        feedback_removed_at: removedAt,
+      })
+      .eq("id", event.id)
+      .select(
+        "id,target_type,target_id,design_id,feedback_id,user_id,rule_hits,model_scores,action,suggestion,original_text,reviewed,feedback_removed,feedback_removed_at,created_at"
+      )
+      .single();
+
+    if (eventUpdateError) {
+      setMsg(
+        "❌ Could not save the removed label before deleting feedback: " +
+          eventUpdateError.message
+      );
+      setBusyId(null);
+      return;
+    }
+
     const { error: upvoteError } = await supabase
       .from("upvotes")
       .delete()
@@ -367,6 +394,7 @@ export default function ModeratePage() {
     if (upvoteError) {
       setMsg("❌ Could not remove related upvotes: " + upvoteError.message);
       setBusyId(null);
+      await load();
       return;
     }
 
@@ -378,23 +406,7 @@ export default function ModeratePage() {
     if (feedbackError) {
       setMsg("❌ Could not remove feedback: " + feedbackError.message);
       setBusyId(null);
-      return;
-    }
-
-    const { error: eventError } = await supabase
-      .from("moderation_events")
-      .update({
-        feedback_removed: true,
-        feedback_removed_at: removedAt,
-      })
-      .eq("id", event.id);
-
-    if (eventError) {
-      setMsg(
-        "❌ Feedback was deleted, but the dashboard could not save the removed label: " +
-          eventError.message
-      );
-      setBusyId(null);
+      await load();
       return;
     }
 
@@ -403,6 +415,7 @@ export default function ModeratePage() {
         item.id === event.id
           ? {
               ...item,
+              ...(updatedEvent as ModerationEvent),
               feedback_removed: true,
               feedback_removed_at: removedAt,
             }
@@ -412,6 +425,8 @@ export default function ModeratePage() {
 
     setMsg("✅ Feedback removed. The moderation card is now labelled as removed.");
     setBusyId(null);
+
+    await load();
   }
 
   if (checkingRole) {
