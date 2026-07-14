@@ -164,9 +164,9 @@ export default function ModeratePage() {
 
     const rows = ((data ?? []) as ModerationEvent[]).map((event) => ({
       ...event,
-      model_scores: (event.model_scores ?? null) as ModelScores | null,
       rule_hits: event.rule_hits ?? [],
-      feedback_removed: event.feedback_removed ?? false,
+      model_scores: (event.model_scores ?? null) as ModelScores | null,
+      feedback_removed: Boolean(event.feedback_removed),
     }));
 
     setEvents(rows);
@@ -327,7 +327,7 @@ export default function ModeratePage() {
     }
 
     const confirmed = window.confirm(
-      "Are you sure you want to remove this feedback? This will delete the public feedback from the design page."
+      "Are you sure you want to remove this feedback? This will delete it from the public design page and mark it as removed in the moderation dashboard."
     );
 
     if (!confirmed) return;
@@ -347,15 +347,6 @@ export default function ModeratePage() {
         setBusyId(null);
         return;
       }
-
-      if (feedbackIdToDelete) {
-        await supabase
-          .from("moderation_events")
-          .update({
-            feedback_id: feedbackIdToDelete,
-          })
-          .eq("id", event.id);
-      }
     }
 
     if (!feedbackIdToDelete) {
@@ -365,6 +356,8 @@ export default function ModeratePage() {
       setBusyId(null);
       return;
     }
+
+    const removedAt = new Date().toISOString();
 
     const { error: upvoteError } = await supabase
       .from("upvotes")
@@ -391,26 +384,34 @@ export default function ModeratePage() {
     const { error: eventError } = await supabase
       .from("moderation_events")
       .update({
-        reviewed: true,
-        feedback_id: feedbackIdToDelete,
         feedback_removed: true,
-        feedback_removed_at: new Date().toISOString(),
+        feedback_removed_at: removedAt,
       })
       .eq("id", event.id);
 
     if (eventError) {
       setMsg(
-        "Feedback was removed, but the moderation event could not be marked as removed: " +
+        "❌ Feedback was deleted, but the dashboard could not save the removed label: " +
           eventError.message
       );
       setBusyId(null);
-      await load();
       return;
     }
 
-    setMsg("✅ Feedback removed.");
+    setEvents((prev) =>
+      prev.map((item) =>
+        item.id === event.id
+          ? {
+              ...item,
+              feedback_removed: true,
+              feedback_removed_at: removedAt,
+            }
+          : item
+      )
+    );
+
+    setMsg("✅ Feedback removed. The moderation card is now labelled as removed.");
     setBusyId(null);
-    await load();
   }
 
   if (checkingRole) {
@@ -434,6 +435,9 @@ export default function ModeratePage() {
     );
   }
 
+  const removedCount = events.filter((event) => event.feedback_removed).length;
+  const unreviewedCount = events.filter((event) => !event.reviewed).length;
+
   return (
     <div className="space-y-6">
       <section className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
@@ -453,6 +457,25 @@ export default function ModeratePage() {
         <button className="btn" type="button" onClick={() => void load()}>
           Refresh
         </button>
+      </section>
+
+      <section className="grid gap-3 sm:grid-cols-3">
+        <div className="glass-card glass p-4">
+          <p className="text-xs text-neutral-500">Total events</p>
+          <p className="mt-1 text-2xl font-semibold">{events.length}</p>
+        </div>
+
+        <div className="glass-card glass p-4">
+          <p className="text-xs text-neutral-500">Unreviewed</p>
+          <p className="mt-1 text-2xl font-semibold">{unreviewedCount}</p>
+        </div>
+
+        <div className="glass-card glass p-4 border border-red-500/30">
+          <p className="text-xs text-red-300">Removed feedback</p>
+          <p className="mt-1 text-2xl font-semibold text-red-200">
+            {removedCount}
+          </p>
+        </div>
       </section>
 
       <section className="flex flex-wrap items-center gap-2">
@@ -498,17 +521,20 @@ export default function ModeratePage() {
             const rules = event.rule_hits ?? [];
             const scores = event.model_scores ?? null;
             const isBusy = busyId === event.id;
-            const isBlocked = event.action === "BLOCK";
             const isRemoved = Boolean(event.feedback_removed);
 
-            const hasPostedFeedback =
+            const canRemoveFeedback =
               !isRemoved &&
-              (event.action === "ALLOW" ||
-                event.action === "NUDGE" ||
-                Boolean(event.feedback_id));
+              event.action !== "BLOCK" &&
+              Boolean(event.feedback_id || event.design_id);
 
             return (
-              <article key={event.id} className="glass-card glass p-5 space-y-4">
+              <article
+                key={event.id}
+                className={`glass-card glass p-5 space-y-4 ${
+                  isRemoved ? "border border-red-500/40" : ""
+                }`}
+              >
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div className="space-y-2">
                     <div className="flex flex-wrap items-center gap-2">
@@ -520,19 +546,15 @@ export default function ModeratePage() {
                         {actionLabel(event.action)}
                       </span>
 
+                      {isRemoved && (
+                        <span className="inline-flex rounded-full border border-red-500/50 bg-red-500/15 px-3 py-1 text-xs font-semibold text-red-200">
+                          Feedback Removed
+                        </span>
+                      )}
+
                       <span className="chip">
                         {event.reviewed ? "Reviewed" : "Unreviewed"}
                       </span>
-
-                      {isRemoved ? (
-                        <span className="chip">Feedback removed</span>
-                      ) : hasPostedFeedback ? (
-                        <span className="chip">Posted feedback</span>
-                      ) : (
-                        <span className="chip">
-                          {isBlocked ? "Blocked before posting" : "No link"}
-                        </span>
-                      )}
                     </div>
 
                     <p className="text-xs text-neutral-500">
@@ -540,7 +562,7 @@ export default function ModeratePage() {
                     </p>
 
                     {isRemoved && (
-                      <p className="text-xs text-red-300">
+                      <p className="text-xs font-medium text-red-300">
                         Removed on {formatDate(event.feedback_removed_at)}
                       </p>
                     )}
@@ -568,12 +590,20 @@ export default function ModeratePage() {
                     )}
 
                     <button
-                      className="btn"
+                      className={
+                        isRemoved
+                          ? "inline-flex items-center justify-center rounded-full border border-red-500/40 bg-red-500/10 px-4 py-2 text-sm font-semibold text-red-200 opacity-70"
+                          : "btn"
+                      }
                       type="button"
-                      disabled={isBusy || !hasPostedFeedback || isRemoved}
+                      disabled={isBusy || !canRemoveFeedback}
                       onClick={() => void removeFeedback(event)}
                     >
-                      {isBusy ? "Working…" : isRemoved ? "Removed" : "Remove feedback"}
+                      {isBusy
+                        ? "Working…"
+                        : isRemoved
+                          ? "Removed"
+                          : "Remove feedback"}
                     </button>
                   </div>
                 </div>
@@ -609,7 +639,11 @@ export default function ModeratePage() {
                     Feedback text analysed by NLP
                   </p>
 
-                  <p className="whitespace-pre-wrap text-sm leading-6 text-neutral-200">
+                  <p
+                    className={`whitespace-pre-wrap text-sm leading-6 ${
+                      isRemoved ? "text-red-100" : "text-neutral-200"
+                    }`}
+                  >
                     {event.original_text || "No original text stored."}
                   </p>
                 </div>
